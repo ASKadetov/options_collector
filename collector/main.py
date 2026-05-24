@@ -77,7 +77,7 @@ def build_summary_rows(summary_data, price_map):
         row = (
             snapshot_ts,
             inst,
-            round(float(price), 2) if price else None,
+            float(price) if price else None,
             round(float(item.get("fwdPx")), 2) if item.get("fwdPx") else None,
             round(float(item.get("askVol")), 3) if item.get("askVol") else None,
             round(float(item.get("bidVol")), 3) if item.get("bidVol") else None,
