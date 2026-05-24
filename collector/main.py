@@ -59,7 +59,7 @@ async def fetch_currency_data(session, currency):
     
     summary_task = fetch_json(session, opt_summary_url, opt_params)
     price_task = fetch_json(session, mark_price_url, mark_params)
-    oi_task = fetch_json(session, mark_price_url, oi_params)
+    oi_task = fetch_json(session, open_interes_url, oi_params)
 
     summary_data, price_data, oi_data = await asyncio.gather(summary_task, price_task, oi_task)
     price_map = {p["instId"]: p["markPx"] for p in price_data} if price_data else None
@@ -180,7 +180,7 @@ async def snapshot_loop():
                     oi_row = build_oi_row(oi)
                     logging.info(f"Получено {len(summary_rows)} строк по {currency}")
                     all_summary_rows.extend(summary_rows)
-                    all_oi_rows.extend(oi_row)
+                    all_oi_rows.append(oi_row)
                 except Exception as e:
                     logging.exception(f"Ошибка при формировании данных по {currency}")
 
