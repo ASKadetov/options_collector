@@ -26,9 +26,9 @@ def get_db_connection():
     )
 
 
-async def fetch_json(session, url):
+async def fetch_json(session, url, params=None):
     try:
-        async with session.get(url, timeout=30) as resp:
+        async with session.get(url, params=params, timeout=30) as resp:
             if resp.status != 200:
                 logging.error(f'HTTP {resp.status} при запросе к {url}')
                 return []
@@ -49,19 +49,25 @@ async def fetch_json(session, url):
 
 
 async def fetch_currency_data(session, currency):
-    opt_summary_url = f"{API_BASE}/api/v5/public/opt-summary?uly={currency}-USD"
-    mark_price_url = f"{API_BASE}/api/v5/public/mark-price?instType=OPTION&uly={currency}-USD"
+    opt_summary_url = f"{API_BASE}/api/v5/public/opt-summary"
+    mark_price_url = f"{API_BASE}/api/v5/public/mark-price"
+    open_interes_url = f"{API_BASE}/api/v5/public/open-interest"
+    
+    opt_params = {"uly": f"{currency}-USD"}
+    mark_params = {"instType": "OPTION", "uly": f"{currency}-USD"}
+    oi_params = {"instType": "SWAP", "instId": f"{currency}-USD-SWAP"}
+    
+    summary_task = fetch_json(session, opt_summary_url, opt_params)
+    price_task = fetch_json(session, mark_price_url, mark_params)
+    oi_task = fetch_json(session, mark_price_url, oi_params)
 
-    summary_task = fetch_json(session, opt_summary_url)
-    price_task = fetch_json(session, mark_price_url)
-
-    summary_data, price_data = await asyncio.gather(summary_task, price_task)
+    summary_data, price_data, oi_data = await asyncio.gather(summary_task, price_task, oi_task)
     price_map = {p["instId"]: p["markPx"] for p in price_data} if price_data else None
 
-    return summary_data, price_map
+    return summary_data, price_map, oi_data[0]
 
 
-def build_rows(summary_data, price_map):
+def build_summary_rows(summary_data, price_map):
     rows = []
     for item in summary_data:
         inst = item["instId"]
@@ -95,30 +101,33 @@ def build_rows(summary_data, price_map):
     return rows
 
 
-def insert_rows(rows):
-    query = """
+def build_oi_row(oi_data):
+    snapshot_ts = datetime.fromtimestamp(float(oi_data['ts']) / 1000.0)
+    instrument_name = oi_data['instId']
+    
+    row = (
+        snapshot_ts,
+        instrument_name,
+        round(float(oi_data.get('oi', 0)), 1),
+        round(float(oi_data.get('oiCcy', 0)), 1),
+        round(float(oi_data.get('oiUsd', 0)), 1)
+    )
+    return row
+
+
+def insert_all_data(summary_rows, oi_rows):
+    summary_query = """
         INSERT INTO option_snapshots (
-            snapshot_ts,
-            instrument_name,
-            mark_price,
-            forward_price,
-            askVol,
-            bidVol,
-            markVol,
-            volLv,
-            realVol,
-            delta,
-            deltaBS,
-            gamma,
-            gammaBS,
-            vega,
-            vegaBS,
-            theta,
-            thetaBS,
-            distance,
-            leverage,
-            buyApr,
-            sellApr
+            snapshot_ts, instrument_name, mark_price, forward_price,
+            askVol, bidVol, markVol, volLv, realVol, 
+            delta, deltaBS, gamma, gammaBS, vega, vegaBS, theta, thetaBS,
+            distance, leverage, buyApr, sellApr
+        )
+        VALUES %s
+    """
+    oi_query = """
+        INSERT INTO open_interest (
+            snapshot_ts, instrument_name, oi, oiccy, oiusd
         )
         VALUES %s
     """
@@ -127,14 +136,29 @@ def insert_rows(rows):
 
     try:
         cur = conn.cursor()
-        execute_values(cur, query, rows)
-        conn.commit()
-        logging.info(f"Вставка {len(rows)} строк в БД")
+        
+        if summary_rows:
+            try:
+                execute_values(cur, summary_query, summary_rows)
+                conn.commit()
+                logging.info(f"Вставка {len(summary_rows)} строк в option_snapshots")
+            except psycopg2.Error:
+                conn.rollback()
+                logging.exception("Ошибка при вставке в option_snapshots.")
+            
+        if oi_rows:
+            try:
+                execute_values(cur, oi_query, oi_rows) 
+                conn.commit()
+                logging.info(f"Вставка {len(oi_rows)} строк в open_interest")
+            except psycopg2.Error:
+                conn.rollback()
+                logging.exception("Ошибка при вставке в open_interest.")
 
-    except psycopg2.Error as e:
-        logging.exception("Ошибка при вставке данных в БД")
-        conn.rollback()
+    except psycopg2.Error:
+        logging.exception("Критическая ошибка при работе с курсором")
         raise
+    
     finally:
         if cur:
             cur.close()
@@ -142,23 +166,27 @@ def insert_rows(rows):
             conn.close()
 
 
+
 async def snapshot_loop():
     async with aiohttp.ClientSession() as session:
-        all_rows = []
+        all_summary_rows = []
+        all_oi_rows = []
 
         for currency in CURRENCIES:
-            summary, prices = await fetch_currency_data(session, currency)
+            summary, prices, oi = await fetch_currency_data(session, currency)
             if summary:
                 try:
-                    rows = build_rows(summary, prices)
-                    logging.info(f"Получено {len(rows)} строк по {currency}")
-                    all_rows.extend(rows)
+                    summary_rows = build_summary_rows(summary, prices)
+                    oi_row = build_oi_row(oi)
+                    logging.info(f"Получено {len(summary_rows)} строк по {currency}")
+                    all_summary_rows.extend(summary_rows)
+                    all_oi_rows.extend(oi_row)
                 except Exception as e:
                     logging.exception(f"Ошибка при формировании данных по {currency}")
 
-        if all_rows:
+        if all_summary_rows or all_oi_rows:
             try:
-                insert_rows(all_rows)
+                insert_all_data(all_summary_rows, all_oi_rows)
             except Exception:
                 logging.exception("Ошибка записи snapshot в БД")
 
